@@ -1,46 +1,35 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha1"
-	"crypto/x509"
-	"encoding/binary"
-	"encoding/pem"
 	"fmt"
-	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/wii-tools/lz11"
-	"hash/crc32"
-	"io"
-	"io/ioutil"
 	"log"
 	"os"
-	"sync"
+
+	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/wii-tools/lz11"
 )
 
 // Votes contains all the children structs needed to
 // make a voting.bin file.
-type Votes struct {
-	Header                   Header
-	NationalQuestionTable    []QuestionInfo
-	WorldWideQuestionTable   []QuestionInfo
-	QuestionTextInfoTable    []QuestionTextInfo
-	QuestionText             []QuestionText
-	NationalResults          []NationalResult
-	DetailedNationalResults  []DetailedNationalResult
-	PositionEntryTable       []byte
-	WorldwideResults         []WorldWideResult
-	WorldwideResultsDetailed []DetailedWorldwideResult
-	CountryInfoTable         []CountryInfoTable
-	CountryTable             []uint16
+// type Votes struct {
+// 	Header                   Header
+// 	NationalQuestionTable    []QuestionInfo
+// 	WorldWideQuestionTable   []QuestionInfo
+// 	QuestionTextInfoTable    []QuestionTextInfo
+// 	QuestionText             []QuestionText
+// 	NationalResults          []NationalResult
+// 	DetailedNationalResults  []DetailedNationalResult
+// 	PositionEntryTable       []byte
+// 	WorldwideResults         []WorldWideResult
+// 	WorldwideResultsDetailed []DetailedWorldwideResult
+// 	CountryInfoTable         []CountryInfoTable
+// 	CountryTable             []uint16
 
-	// Static values
-	currentCountryCode  uint8
-	tempDetailedResults []DetailedNationalResult
-}
+// 	// Static values
+// 	currentCountryCode  uint8
+// 	tempDetailedResults []DetailedNationalResult
+// }
 
 // SQL variables.
 var (
@@ -57,195 +46,122 @@ func checkError(err error) {
 }
 
 func main() {
-	err := os.WriteFile("votes/first_data.bin", MakeFirstData(), 0666)
+	// // var err error
+	// var countryCode uint8 = 49
+
+	// votes := Votes{}
+	// votes.currentCountryCode = countryCode
+
+	compressed, err := os.ReadFile("voting.bin")
 	checkError(err)
+	fmt.Println("voting.bin length", len(compressed))
 
-	fileType = GetFileType(os.Args[1])
-	if len(os.Args) >= 3 {
-		locality = GetLocality(os.Args[2])
-	} else {
-		locality = All
-	}
-
-	// Get config
-	config := GetConfig()
-
-	// Start SQL
-	dbString := fmt.Sprintf("postgres://%s:%s@%s/%s", config.Username, config.Password, config.DatabaseAddress, config.DatabaseName)
-	dbConf, err := pgxpool.ParseConfig(dbString)
+	// will ignore trailing data past "output length = header number".
+	buffer, err := lz11.Decompress(compressed)
 	checkError(err)
-	pool, err = pgxpool.ConnectConfig(ctx, dbConf)
-	checkError(err)
+	fmt.Println("decompressed length", len(buffer))
 
-	defer pool.Close()
-
-	// First, we will create a housing directory for all our files.
-	err = os.Mkdir("votes", 0755)
-	if !os.IsExist(err) {
-		checkError(err)
-	}
-
-	// Next prepare the questions for every region + Worldwide results.
-	PrepareQuestions()
-	PrepareWorldWideResults()
-
-	wg := sync.WaitGroup{}
-	wg.Add(len(countryCodes))
-	for _, countryCode := range countryCodes {
-		go func(countryCode uint8) {
-			defer wg.Done()
-			votes := Votes{}
-			votes.currentCountryCode = countryCode
-
-			// Create the file to write to
-			strCountryCode := ZFill(countryCode, 3)
-			err = os.Mkdir(fmt.Sprintf("votes/%s", strCountryCode), 0755)
-			if !os.IsExist(err) {
-				// If the folder exists we can just continue
-				checkError(err)
-			}
-
-			buffer := bytes.NewBuffer(nil)
-
-			// Header
-			votes.MakeHeader()
-
-			if fileType == Normal || fileType == _Question {
-				// Questions
-				if len(questions) != 0 {
-					votes.MakeNationalQuestionsTable()
-				}
-
-				if len(worldwideQuestions) != 0 {
-					votes.MakeWorldWideQuestionsTable()
-				}
-
-				if len(worldwideQuestions) != 0 || len(questions) != 0 {
-					votes.MakeQuestionsTable()
-				}
-			}
-
-			// National Results
-			if fileType == Normal || fileType == Results {
-				if locality != Worldwide {
-					votes.MakeNationalResultsTable()
-					votes.MakeDetailedNationalResultsTable()
-					votes.MakePositionTable()
-				}
-
-				if locality != National {
-					votes.MakeWorldWideResultsTable()
-					votes.MakeDetailedWorldWideResults()
-				}
-			}
-
-			if (fileType == Normal || fileType == Results) && locality != National {
-				// Country Table + Text
-				votes.MakeCountryInfoTable()
-				votes.MakeCountryTable()
-			}
-
-			// Write to byte buffer, add the file size, calculate crc32 then write file
-			votes.WriteAll(buffer)
-
-			crcTable := crc32.MakeTable(crc32.IEEE)
-			checksum := crc32.Checksum(buffer.Bytes()[12:], crcTable)
-			votes.Header.CRC32 = checksum
-			votes.Header.Filesize = uint32(buffer.Len())
-
-			// Reset the temp buffer and compress
-			buffer.Reset()
-			votes.WriteAll(buffer)
-
-			compressed, err := lz11.Compress(buffer.Bytes())
-			checkError(err)
-
-			signed := SignFile(compressed)
-
-			filename := GetFilename(strCountryCode)
-
-			create, err := os.Create(fmt.Sprintf("votes/%s/%s", strCountryCode, filename))
-			checkError(err)
-
-			_, err = create.Write(signed)
-			checkError(err)
-		}(countryCode)
-	}
-
-	wg.Wait()
-}
-
-// Write writes the current values in Votes to an io.Writer method.
-// This is required as Go cannot write structs with non-fixed slice sizes,
-// but can write them individually.
-func (v *Votes) Write(writer io.Writer, data interface{}) {
-	err := binary.Write(writer, binary.BigEndian, data)
+	err = os.WriteFile("voting-decomp.bin", buffer, 0644)
 	checkError(err)
 }
 
-func (v *Votes) WriteAll(writer io.Writer) {
-	v.Write(writer, v.Header)
+// // DiscardPKCS1v15Signature extracts the PKCS1v15 signature length from a file
+// // and discards the signature, returning the original data without the signature.
+// func DiscardPKCS1v15Signature(filepath string) ([]byte, error) {
+// 	// Read the file
+// 	data, err := ioutil.ReadFile(filepath)
+// 	if err != nil {
+// 		return nil, err
+// 	}
 
-	// Questions
-	v.Write(writer, v.NationalQuestionTable)
-	v.Write(writer, v.WorldWideQuestionTable)
-	v.Write(writer, v.QuestionTextInfoTable)
+// 	// Decode PEM block
+// 	block, _ := pem.Decode(data)
+// 	if block == nil {
+// 		return nil, errors.New("failed to decode PEM block")
+// 	}
 
-	// Go doesn't like nested slices in structs.
-	for _, question := range v.QuestionText {
-		v.Write(writer, question.Question)
-		v.Write(writer, question.Response1)
-		v.Write(writer, question.Response2)
-	}
+// 	// The signature lies after the data.
 
-	// National Results
-	v.Write(writer, v.NationalResults)
-	v.Write(writer, v.DetailedNationalResults)
-	v.Write(writer, v.PositionEntryTable)
+// 	// /usr/lib/go/src/crypto/rsa/pkcs1v15.go
+// 	// 	crypto.SHA1:      {0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14},
+// 	// 15 bytes.
 
-	// Worldwide Results
-	v.Write(writer, v.WorldwideResults)
-	v.Write(writer, v.WorldwideResultsDetailed)
+// 	// Discard the signature and return the original data
+// 	originalData := block.Bytes[:len(block.Bytes)-signatureLength]
+// 	return originalData, nil
+// }
 
-	v.Write(writer, v.CountryInfoTable)
-	v.Write(writer, v.CountryTable)
-}
+// // Write writes the current values in Votes to an io.Writer method.
+// // This is required as Go cannot write structs with non-fixed slice sizes,
+// // but can write them individually.
+// func (v *Votes) Write(writer io.Writer, data interface{}) {
+// 	err := binary.Write(writer, binary.BigEndian, data)
+// 	checkError(err)
+// }
 
-// GetCurrentSize returns the current size of our Votes struct.
-// This is useful for calculating the current offset of Votes.
-func (v *Votes) GetCurrentSize() uint32 {
-	buffer := bytes.NewBuffer([]byte{})
-	v.WriteAll(buffer)
+// func (v *Votes) WriteAll(writer io.Writer) {
+// 	v.Write(writer, v.Header)
 
-	return uint32(buffer.Len())
-}
+// 	// Questions
+// 	v.Write(writer, v.NationalQuestionTable)
+// 	v.Write(writer, v.WorldWideQuestionTable)
+// 	v.Write(writer, v.QuestionTextInfoTable)
 
-func SignFile(contents []byte) []byte {
-	buffer := bytes.NewBuffer(nil)
+// 	// Go doesn't like nested slices in structs.
+// 	for _, question := range v.QuestionText {
+// 		v.Write(writer, question.Question)
+// 		v.Write(writer, question.Response1)
+// 		v.Write(writer, question.Response2)
+// 	}
 
-	// Get RSA key and sign
-	rsaData, err := ioutil.ReadFile("Private.pem")
-	checkError(err)
+// 	// National Results
+// 	v.Write(writer, v.NationalResults)
+// 	v.Write(writer, v.DetailedNationalResults)
+// 	v.Write(writer, v.PositionEntryTable)
 
-	rsaBlock, _ := pem.Decode(rsaData)
+// 	// Worldwide Results
+// 	v.Write(writer, v.WorldwideResults)
+// 	v.Write(writer, v.WorldwideResultsDetailed)
 
-	parsedKey, err := x509.ParsePKCS1PrivateKey(rsaBlock.Bytes)
-	checkError(err)
+// 	v.Write(writer, v.CountryInfoTable)
+// 	v.Write(writer, v.CountryTable)
+// }
 
-	// Hash our data then sign
-	hash := sha1.New()
-	_, err = hash.Write(contents)
-	checkError(err)
+// // GetCurrentSize returns the current size of our Votes struct.
+// // This is useful for calculating the current offset of Votes.
+// func (v *Votes) GetCurrentSize() uint32 {
+// 	buffer := bytes.NewBuffer([]byte{})
+// 	v.WriteAll(buffer)
 
-	contentsHashSum := hash.Sum(nil)
+// 	return uint32(buffer.Len())
+// }
 
-	reader := rand.Reader
-	signature, err := rsa.SignPKCS1v15(reader, parsedKey, crypto.SHA1, contentsHashSum)
-	checkError(err)
+// func SignFile(contents []byte) []byte {
+// 	buffer := bytes.NewBuffer(nil)
 
-	buffer.Write(make([]byte, 64))
-	buffer.Write(signature)
-	buffer.Write(contents)
+// 	// Get RSA key and sign
+// 	rsaData, err := ioutil.ReadFile("Private.pem")
+// 	checkError(err)
 
-	return buffer.Bytes()
-}
+// 	rsaBlock, _ := pem.Decode(rsaData)
+
+// 	parsedKey, err := x509.ParsePKCS1PrivateKey(rsaBlock.Bytes)
+// 	checkError(err)
+
+// 	// Hash our data then sign
+// 	hash := sha1.New()
+// 	_, err = hash.Write(contents)
+// 	checkError(err)
+
+// 	contentsHashSum := hash.Sum(nil)
+
+// 	reader := rand.Reader
+// 	signature, err := rsa.SignPKCS1v15(reader, parsedKey, crypto.SHA1, contentsHashSum)
+// 	checkError(err)
+
+// 	buffer.Write(make([]byte, 64))
+// 	buffer.Write(signature)
+// 	buffer.Write(contents)
+
+// 	return buffer.Bytes()
+// }
