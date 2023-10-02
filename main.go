@@ -52,9 +52,15 @@ func main() {
 	// votes := Votes{}
 	// votes.currentCountryCode = countryCode
 
-	compressed, err := os.ReadFile("voting.bin")
+	// compressed, err := os.ReadFile("voting.bin")
+	// checkError(err)
+	// fmt.Println("voting.bin length", len(compressed))
+
+	buffer := []byte{1, 2, 3}
+	compressed, err := lz11.Compress(buffer)
 	checkError(err)
-	fmt.Println("voting.bin length", len(compressed))
+
+	compressed = append([]byte{1, 2, 3, 4}, compressed...)
 
 	// wc24 is nonstandard and puts pkcs1v15 before data.
 	n := len(compressed)
@@ -68,13 +74,13 @@ func main() {
 
 			buffer, err := lz11.Decompress(compressed[begin:])
 			if err != nil {
-				if err != lz11.ErrInvalidMagic {
+				if err != lz11.ErrInvalidMagic && err != lz11.ErrCompressedTooSmall {
 					fmt.Println(begin, err)
 				}
 				return
 			}
 
-			fmt.Println("prefix length", begin, "decompressed length", len(buffer))
+			fmt.Println("success, prefix length", begin, "decompressed length", len(buffer))
 
 			err = os.WriteFile(fmt.Sprintf("voting-%d.bin", begin), buffer, 0644)
 			checkError(err)
