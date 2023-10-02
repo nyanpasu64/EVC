@@ -56,13 +56,30 @@ func main() {
 	checkError(err)
 	fmt.Println("voting.bin length", len(compressed))
 
-	// will ignore trailing data past "output length = header number".
-	buffer, err := lz11.Decompress(compressed)
-	checkError(err)
-	fmt.Println("decompressed length", len(buffer))
+	// wc24 is nonstandard and puts pkcs1v15 before data.
+	n := len(compressed)
+	for begin := 1; begin < n; begin++ {
+		func() {
+			defer func() {
+				if x := recover(); x != nil {
+					log.Printf("run time panic: %v", x)
+				}
+			}()
 
-	err = os.WriteFile("voting-decomp.bin", buffer, 0644)
-	checkError(err)
+			buffer, err := lz11.Decompress(compressed[begin:])
+			if err != nil {
+				if err != lz11.ErrInvalidMagic {
+					fmt.Println(begin, err)
+				}
+				return
+			}
+
+			fmt.Println("prefix length", begin, "decompressed length", len(buffer))
+
+			err = os.WriteFile(fmt.Sprintf("voting-%d.bin", begin), buffer, 0644)
+			checkError(err)
+		}()
+	}
 }
 
 // // DiscardPKCS1v15Signature extracts the PKCS1v15 signature length from a file
@@ -74,17 +91,23 @@ func main() {
 // 		return nil, err
 // 	}
 
-// 	// Decode PEM block
-// 	block, _ := pem.Decode(data)
-// 	if block == nil {
-// 		return nil, errors.New("failed to decode PEM block")
-// 	}
-
-// 	// The signature lies after the data.
-
 // 	// /usr/lib/go/src/crypto/rsa/pkcs1v15.go
 // 	// 	crypto.SHA1:      {0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14},
 // 	// 15 bytes.
+
+// 	// k := pub.Size()
+// 	// if k < tLen+11 {
+// 	// 	return ErrVerification
+// 	// }
+
+// 	// // RFC 8017 Section 8.2.2: If the length of the signature S is not k
+// 	// // octets (where k is the length in octets of the RSA modulus n), output
+// 	// // "invalid signature" and stop.
+// 	// if k != len(sig) {
+// 	// 	return ErrVerification
+// 	// }
+
+// 	// [ ] what's the WL24 public key?
 
 // 	// Discard the signature and return the original data
 // 	originalData := block.Bytes[:len(block.Bytes)-signatureLength]
